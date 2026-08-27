@@ -125,6 +125,10 @@ is_uint "${POLL_INTERVAL}"   || POLL_INTERVAL=3
 is_uint "${STABLE_CHECKS}"   || STABLE_CHECKS=2
 [ "${STABLE_CHECKS}" -ge 1 ] || STABLE_CHECKS=1
 
+# Retention: delete remote backups older than RETENTION_DAYS days. 0 = disabled.
+RETENTION_DAYS="${RETENTION_DAYS:-0}"
+is_uint "${RETENTION_DAYS}" || RETENTION_DAYS=0
+
 # Storage Configuration
 # Supported remote STORAGE_TYPE: 's3', 'ftp', 'ftps', 'sftp'
 STORAGE_TYPE="${STORAGE_TYPE:-s3}"
@@ -282,6 +286,12 @@ Transfer integrity:
   Uploads are verified by comparing uploaded byte count with the local file
   size. The local archive is only deleted when DELETE_LOCAL=true AND the
   upload was verified.
+
+Retention (RETENTION_DAYS):
+  After a successful upload, remote backup folders older than RETENTION_DAYS
+  days are deleted (0 = disabled). Date is inferred from the YYYY-MM-DD segment
+  in the remote path. Supported for s3 (requires S3_SIGN_VERSION=v4), ftp and
+  ftps. SFTP retention is not supported (curl cannot delete SFTP files).
 
 Cron Example (Daily at 2:00 AM):
   0 2 * * * /bin/bash ${SCRIPT_DIR}/backup.sh >> ${USER_HOME}/backup_cron.log 2>&1
@@ -715,6 +725,220 @@ backup_to_sftp() {
   return 1
 }
 
+# =============================================================================
+# Retention (RETENTION_DAYS): delete remote YYYY-MM-DD folders older than N days.
+# Supported: s3 (v4), ftp, ftps. SFTP unsupported (curl cannot delete SFTP files).
+# =============================================================================
+
+# Strip the trailing YYYY-MM-DD segment from a remote path. Returns 1 if absent.
+remote_parent() {
+  local p="$1"
+  p="${p#/}"
+  p="${p%/}"
+  if [[ "${p}" =~ ^(.*/)?[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+# Extract a YYYY-MM-DD date from any string (or empty).
+extract_remote_date() {
+  printf '%s' "$1" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -n1
+}
+
+# Generic signed S3 request (SigV4 only). Prints raw body + "\nHTTP_CODE".
+# Usage: s3_signed_request METHOD CANONICAL_URI QUERY HOST [curl args...]
+s3_signed_request() {
+  local method="$1" canonical_uri="$2" query="$3" host="$4"
+  shift 4
+  local -a curl_extra=("$@")
+
+  local amz_date date_stamp scope payload_hash signed_headers
+  amz_date="$(date -u '+%Y%m%dT%H%M%SZ')"
+  date_stamp="${amz_date:0:8}"
+  scope="${date_stamp}/${S3_REGION}/s3/aws4_request"
+  payload_hash="UNSIGNED-PAYLOAD"
+  signed_headers="host;x-amz-content-sha256;x-amz-date"
+
+  local canonical_request string_to_sign
+  canonical_request="$(printf '%s\n%s\n%s\nhost:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n\n%s\n%s' \
+    "${method}" "${canonical_uri}" "${query}" "${host}" "${payload_hash}" "${amz_date}" "${signed_headers}" "${payload_hash}")"
+  string_to_sign="$(printf 'AWS4-HMAC-SHA256\n%s\n%s\n%s' \
+    "${amz_date}" "${scope}" "$(printf '%s' "${canonical_request}" | sha256_hex)")"
+
+  local k_date k_region k_service k_signing signature auth_header
+  k_date="$(hmac_sha256_bin "$(str_to_hexkey "AWS4${S3_SECRET}")" "${date_stamp}")"
+  k_region="$(hmac_sha256_bin "${k_date}" "${S3_REGION}")"
+  k_service="$(hmac_sha256_bin "${k_region}" "s3")"
+  k_signing="$(hmac_sha256_bin "${k_service}" "aws4_request")"
+  signature="$(printf '%s' "${string_to_sign}" | hmac_sha256_hex "${k_signing}")"
+  auth_header="AWS4-HMAC-SHA256 Credential=${S3_KEY}/${scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
+
+  local cfg
+  cfg="$(printf 'header = "Authorization: %s"\nheader = "x-amz-date: %s"\nheader = "x-amz-content-sha256: %s"\n' \
+    "${auth_header}" "${amz_date}" "${payload_hash}")"
+
+  local url
+  if [ "${S3_USE_PATH_STYLE}" = "true" ]; then
+    url="${S3_PROTOCOL}://${S3_ENDPOINT}${canonical_uri}"
+  else
+    url="${S3_PROTOCOL}://${host}${canonical_uri}"
+  fi
+  [ -n "${query}" ] && url="${url}?${query}"
+
+  printf '%s' "${cfg}" | curl -s \
+    "${CURL_OPTS[@]}" \
+    -X "${method}" \
+    --config - \
+    "${curl_extra[@]}" \
+    -w '\n%{http_code}' \
+    "${url}" 2>&1
+}
+
+# Delete a single S3 object by key. Returns 0 on success (2xx).
+s3_delete_key() {
+  local key="$1"
+  local host canonical_uri
+  if [ "${S3_USE_PATH_STYLE}" = "true" ]; then
+    host="${S3_ENDPOINT}"
+    canonical_uri="/$(s3_uri_encode "${S3_BUCKET}")/$(s3_uri_encode "${key}")"
+  else
+    host="${S3_BUCKET}.${S3_ENDPOINT}"
+    canonical_uri="/$(s3_uri_encode "${key}")"
+  fi
+  local resp code
+  resp="$(s3_signed_request DELETE "${canonical_uri}" "" "${host}")"
+  code="$(printf '%s\n' "${resp}" | tail -n1)"
+  [[ "${code}" =~ ^2[0-9][0-9]$ ]]
+}
+
+# S3 retention: list objects under the parent prefix and delete any whose
+# date segment (YYYY-MM-DD) is older than the cutoff.
+retention_s3() {
+  local cutoff_epoch="$1"
+  [ "${S3_SIGN_VERSION}" = "v4" ] || {
+    log_warn "S3 retention (RETENTION_DAYS) requires S3_SIGN_VERSION=v4; skipping retention."
+    return 0
+  }
+
+  local parent
+  parent="$(remote_parent "${S3_PATH_PREFIX}")"
+  if [ -z "${parent}" ]; then
+    log_warn "S3_PATH_PREFIX has no date segment (YYYY-MM-DD); cannot apply retention."
+    return 0
+  fi
+
+  local host canonical
+  if [ "${S3_USE_PATH_STYLE}" = "true" ]; then
+    host="${S3_ENDPOINT}"
+    canonical="/$(s3_uri_encode "${S3_BUCKET}")/"
+  else
+    host="${S3_BUCKET}.${S3_ENDPOINT}"
+    canonical="/"
+  fi
+
+  local query resp code body
+  query="list-type=2&prefix=$(s3_uri_encode "${parent}")"
+  resp="$(s3_signed_request GET "${canonical}" "${query}" "${host}")"
+  code="$(printf '%s\n' "${resp}" | tail -n1)"
+  body="$(printf '%s\n' "${resp}" | sed '$d')"
+
+  if [[ ! "${code}" =~ ^2[0-9][0-9]$ ]]; then
+    log_warn "S3 retention: list failed (HTTP ${code}); skipping retention."
+    return 0
+  fi
+
+  local key date_str m
+  while IFS= read -r key; do
+    [ -z "${key}" ] && continue
+    date_str="$(extract_remote_date "${key}")"
+    [ -n "${date_str}" ] || continue
+    m="$(date -d "${date_str}" +%s 2>/dev/null || true)"
+    [ -n "${m}" ] || continue
+    if [ "${m}" -lt "${cutoff_epoch}" ]; then
+      if s3_delete_key "${key}"; then
+        log_info "  Retention: deleted ${key} (${date_str})"
+      else
+        log_warn "  Retention: failed to delete ${key}"
+      fi
+    fi
+  done < <(printf '%s\n' "${body}" | grep -oE '<Key>[^<]*</Key>' | sed -E 's#</?Key>##g')
+}
+
+# FTP helpers (shared by ftp/ftps retention)
+
+# Recursively remove a remote FTP directory (delete files then RMD the dir).
+ftp_rm_r() {
+  local dir="$1"
+  local proto="ftp"
+  local -a ssl_args=()
+  [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ] && ssl_args+=(--ssl)
+
+  local files f
+  files="$(curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --list-only \
+    "${proto}://${FTP_HOST}:${FTP_PORT}/${dir}/" 2>/dev/null || true)"
+  while IFS= read -r f; do
+    [ -z "${f}" ] && continue
+    curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" \
+      -Q "DELE ${dir}/${f}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1 || true
+  done <<< "${files}"
+  curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" \
+    -Q "RMD ${dir}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1 || true
+}
+
+# FTP/FTPS retention: list date dirs under the parent and remove older ones.
+retention_ftp() {
+  local cutoff_epoch="$1"
+  local parent
+  parent="$(remote_parent "${FTP_PATH}")"
+  if [ -z "${parent}" ]; then
+    log_warn "FTP_PATH has no date segment (YYYY-MM-DD); cannot apply retention."
+    return 0
+  fi
+
+  local proto="ftp"
+  local -a ssl_args=()
+  [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ] && ssl_args+=(--ssl)
+
+  local listing
+  listing="$(curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --list-only \
+    "${proto}://${FTP_HOST}:${FTP_PORT}/${parent}" 2>/dev/null || true)"
+
+  local name date_str m
+  while IFS= read -r name; do
+    [ -z "${name}" ] && continue
+    date_str="$(extract_remote_date "${name}")"
+    [ -n "${date_str}" ] || continue
+    m="$(date -d "${date_str}" +%s 2>/dev/null || true)"
+    [ -n "${m}" ] || continue
+    if [ "${m}" -lt "${cutoff_epoch}" ]; then
+      if ftp_rm_r "${parent%/}/${name}"; then
+        log_info "  Retention: deleted ${parent}/${name}"
+      else
+        log_warn "  Retention: failed to delete ${parent}/${name}"
+      fi
+    fi
+  done <<< "${listing}"
+}
+
+# Retention dispatcher.
+apply_retention() {
+  local days="$1"
+  local cutoff_epoch=$(( $(date +%s) - days * 86400 ))
+  case "${STORAGE_TYPE}" in
+    s3)
+      retention_s3 "${cutoff_epoch}"
+      ;;
+    ftp|ftps)
+      retention_ftp "${cutoff_epoch}"
+      ;;
+    sftp)
+      log_warn "SFTP retention (RETENTION_DAYS) is not supported (curl cannot delete SFTP files); skipping."
+      ;;
+  esac
+}
+
 # Storage Dispatcher
 upload_backup() {
   local local_path="$1"
@@ -1089,7 +1313,13 @@ main() {
     exit 1
   fi
 
-  # Step 3: Remove Local Backup Archive (only after VERIFIED upload)
+  # Step 3: Retention cleanup (delete remote backups older than RETENTION_DAYS)
+  if [ "${RETENTION_DAYS}" -gt 0 ]; then
+    log_info "Applying retention: keeping backups newer than ${RETENTION_DAYS} day(s)."
+    apply_retention "${RETENTION_DAYS}"
+  fi
+
+  # Step 4: Remove Local Backup Archive (only after VERIFIED upload)
   if [ "${DELETE_LOCAL}" = "true" ]; then
     log_info "Removing local temporary backup file to save disk space: ${BACKUP_FILE_PATH}"
     if rm -f -- "${BACKUP_FILE_PATH}"; then
@@ -1101,7 +1331,7 @@ main() {
     log_info "Keeping local archive (DELETE_LOCAL=false): ${BACKUP_FILE_PATH}"
   fi
 
-  # Step 4: Final Summary & Notification
+  # Step 5: Final Summary & Notification
   local total_duration=$(( $(date +%s) - overall_start_time ))
   local formatted_duration
   formatted_duration="$(format_duration "${total_duration}")"

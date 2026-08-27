@@ -93,6 +93,7 @@ BACKUP_TIMEOUT_SECONDS=600               # max wait for backup, seconds
 BACKUP_POLL_INTERVAL_SECONDS=3
 DELETE_LOCAL_AFTER_UPLOAD=true           # delete archive after verified upload
 BACKUP_STABLE_CHECKS=2                   # stable-size polls before considered done
+RETENTION_DAYS=0                         # delete remote backups older than N days (0=off)
 
 # Curl transfer hardening
 CURL_CONNECT_TIMEOUT=30
@@ -154,6 +155,7 @@ TELEGRAM_CHAT_ID=
 | `BACKUP_TIMEOUT_SECONDS` | Max wait for backup generation | `600` |
 | `BACKUP_POLL_INTERVAL_SECONDS` | Poll interval while waiting | `3` |
 | `BACKUP_STABLE_CHECKS` | Stable-size polls before completion | `2` |
+| `RETENTION_DAYS` | Delete remote backups older than N days after successful upload (`0` = off) | `0` |
 
 ### Storage Configuration
 
