@@ -38,6 +38,7 @@ if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )
 fi
 
 # Color Definitions (disabled when stdout is not a TTY, e.g. cron, or NO_COLOR set)
+# NOTE: every variable must be assigned in BOTH branches (set -u safety).
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   RED='\033[0;31m'
   GREEN='\033[0;32m'
@@ -45,6 +46,7 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   CYAN='\033[0;36m'
   MAGENTA='\033[0;35m'
   BOLD='\033[1m'
+  NC='\033[0m'
 else
   RED='' GREEN='' YELLOW='' CYAN='' MAGENTA='' BOLD='' NC=''
 fi
