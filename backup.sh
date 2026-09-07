@@ -582,6 +582,27 @@ parse_curl_meta() {
   PARSED_META=(${meta_line})
 }
 
+# Translate common curl exit codes into actionable messages.
+describe_curl_exit() {
+  case "$1" in
+    6)  printf 'could not resolve host' ;;
+    7)  printf 'could not connect to server (check host/port/firewall)' ;;
+    28) printf 'operation timed out (transfer stalled below 1 KB/s for CURL_STALL_TIMEOUT seconds - raise CURL_STALL_TIMEOUT for large files on slow links)' ;;
+    35) printf 'SSL/TLS handshake failure' ;;
+    45) printf 'FTP access denied (check credentials/permissions)' ;;
+    55) printf 'send error (connection lost mid-transfer)' ;;
+    56) printf 'recv error (connection reset by server)' ;;
+    60) printf 'SSL certificate problem' ;;
+    67) printf 'login denied (wrong username/password)' ;;
+    *)  printf 'curl error %s (see curl.se/libcurl/c/libcurl-errors.html)' "$1" ;;
+  esac
+}
+
+# Percentage helper for progress messages.
+pct() { # pct <part> <total>
+  awk -v a="$1" -v b="$2" 'BEGIN { if (b+0 > 0) printf "%d%%", a*100/b; else printf "?" }'
+}
+
 # Storage Driver: S3 (SigV4 default, SigV2 legacy)
 backup_to_s3() {
   local local_path="$1"
@@ -664,21 +685,22 @@ backup_to_s3() {
     --config - \
     "${upload_url}" 2>&1)" || rc=$?
 
-  if [ "${rc}" -ne 0 ]; then
-    log_error "Upload to S3 failed (curl exit code: ${rc})."
-    return 1
-  fi
-
+  # Parse progress even on failure so logs show how far the upload got
   parse_curl_meta "${response}"
   http_code="${PARSED_META[0]:-0}"
   up_bytes="${PARSED_META[1]:-0}"
+
+  if [ "${rc}" -ne 0 ]; then
+    log_error "Upload to S3 failed at $(format_bytes "${up_bytes}") of $(format_bytes "${expected_size}") ($(pct "${up_bytes}" "${expected_size}")) - $(describe_curl_exit "${rc}")."
+    return 1
+  fi
 
   if [[ "${http_code}" =~ ^2[0-9][0-9]$ ]] && [ "${up_bytes}" = "${expected_size}" ]; then
     log_success "Upload to S3 completed successfully (HTTP ${http_code}, verified ${up_bytes} bytes)."
     return 0
   fi
 
-  log_error "Upload to S3 failed or incomplete (HTTP ${http_code}, uploaded ${up_bytes} of ${expected_size} bytes)."
+  log_error "Upload to S3 failed or incomplete (HTTP ${http_code}, uploaded ${up_bytes} of ${expected_size} bytes - $(pct "${up_bytes}" "${expected_size}"))."
   local response_body
   response_body="$(printf '%s\n' "${response}" | sed '$d')"
   if [ -n "${response_body}" ]; then
@@ -723,20 +745,21 @@ backup_to_ftp() {
     -T "${local_path}" \
     "${proto}://${FTP_HOST}:${FTP_PORT}${ftp_path}${file_name}" 2>&1)" || rc=$?
 
-  if [ "${rc}" -ne 0 ]; then
-    log_error "Upload to FTP failed (Exit Code: ${rc}, Output: ${output})."
-    return 1
-  fi
-
+  # Parse progress even on failure so logs show how far the upload got
   parse_curl_meta "${output}"
   up_bytes="${PARSED_META[0]:-0}"
+
+  if [ "${rc}" -ne 0 ]; then
+    log_error "Upload to FTP failed at $(format_bytes "${up_bytes}") of $(format_bytes "${expected_size}") ($(pct "${up_bytes}" "${expected_size}")) - $(describe_curl_exit "${rc}")."
+    return 1
+  fi
 
   if [ "${up_bytes}" = "${expected_size}" ]; then
     log_success "Upload to FTP completed successfully (verified ${up_bytes} bytes)."
     return 0
   fi
 
-  log_error "Upload to FTP incomplete (uploaded ${up_bytes} of ${expected_size} bytes)."
+  log_error "Upload to FTP incomplete (uploaded ${up_bytes} of ${expected_size} bytes - $(pct "${up_bytes}" "${expected_size}"))."
   return 1
 }
 
@@ -777,20 +800,21 @@ backup_to_sftp() {
     -T "${local_path}" \
     "${sftp_url}" 2>&1)" || rc=$?
 
-  if [ "${rc}" -ne 0 ]; then
-    log_error "Upload to SFTP failed (Exit Code: ${rc}, Output: ${output})."
-    return 1
-  fi
-
+  # Parse progress even on failure so logs show how far the upload got
   parse_curl_meta "${output}"
   up_bytes="${PARSED_META[0]:-0}"
+
+  if [ "${rc}" -ne 0 ]; then
+    log_error "Upload to SFTP failed at $(format_bytes "${up_bytes}") of $(format_bytes "${expected_size}") ($(pct "${up_bytes}" "${expected_size}")) - $(describe_curl_exit "${rc}")."
+    return 1
+  fi
 
   if [ "${up_bytes}" = "${expected_size}" ]; then
     log_success "Upload to SFTP completed successfully (verified ${up_bytes} bytes)."
     return 0
   fi
 
-  log_error "Upload to SFTP incomplete (uploaded ${up_bytes} of ${expected_size} bytes)."
+  log_error "Upload to SFTP incomplete (uploaded ${up_bytes} of ${expected_size} bytes - $(pct "${up_bytes}" "${expected_size}"))."
   return 1
 }
 
