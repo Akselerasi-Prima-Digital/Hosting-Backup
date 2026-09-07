@@ -13,9 +13,10 @@
 #
 # Security notes:
 #   - FTP/SFTP/DA credentials go to curl via a 0600 netrc file (removed on
-#     exit), so they never appear in `ps`. S3 keys, however, must be passed to
-#     openssl to build the request signature and WILL be visible in `ps` to
-#     other local users while signing runs. Run this on a trusted host.
+#     exit), so they never appear in `ps`. S3 signing passes only hex-encoded
+#     intermediate keys to openssl's argv (never the raw secret); on a shared
+#     host, other local users can still observe process arguments while
+#     signing runs. Run this on a trusted host.
 #   - SFTP uploads use --insecure (no host-key check) - see SFTP_INSECURE.
 #   - Local archive is deleted after upload ONLY if the uploaded byte count
 #     matches the local file size.
@@ -26,27 +27,42 @@
 
 set -Eeuo pipefail
 
-# Color Definitions
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-BOLD='\033[1m'
-NC='\033[0m'
+# Requires Bash 4.0+ (associative-free but uses [[ ]], arrays, ${var,,} etc.)
+if (( BASH_VERSINFO[0] < 4 )); then
+  printf 'ERROR: bash 4.0 or newer is required (found %s).\n' "${BASH_VERSION}" >&2
+  exit 1
+fi
+# Propagate command-substitution failures inside assignments (Bash 4.4+)
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+  shopt -s inherit_errexit
+fi
 
-# Base Directory
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+# Color Definitions (disabled when stdout is not a TTY, e.g. cron, or NO_COLOR set)
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  RED='\033[0;31m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[1;33m'
+  CYAN='\033[0;36m'
+  MAGENTA='\033[0;35m'
+  BOLD='\033[1m'
+else
+  RED='' GREEN='' YELLOW='' CYAN='' MAGENTA='' BOLD='' NC=''
+fi
+readonly RED GREEN YELLOW CYAN MAGENTA BOLD NC
 
-# Globals
+# Base Directory & Identity (readonly constants)
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+readonly SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
+
+# Globals (mutable runtime state)
 DRY_RUN="false"
 DESTINATION_STR=""
 BACKUP_FILE_PATH=""
 BACKUP_FILE_NAME=""
 BACKUP_FILE_SIZE="0"
 NETRC_FILE=""
-SCRIPT_START_EPOCH="$(date +%s)"
-BACKUP_DATE="$(date +%F)"
+readonly SCRIPT_START_EPOCH="$(date +%s)"
+readonly BACKUP_DATE="$(date +%F)"
 
 # Load Configuration (.env / config.env)
 # Safe loader: no word splitting, no glob expansion, no GNU-xargs dependency.
@@ -92,10 +108,13 @@ else
 fi
 
 # Warn if the config file holding credentials is readable by group/others.
-# Warn if the config file holding credentials is readable by group/others.
-if [ -f "${ENV_FILE}" ] || [ -f "${SCRIPT_DIR}/config.env" ]; then
-  _env_path="${ENV_FILE}"
+# Defined here, called after the logging functions are available.
+check_env_permissions() {
+  local _env_path="${ENV_FILE}"
   [ -f "${_env_path}" ] || _env_path="${SCRIPT_DIR}/config.env"
+  [ -f "${_env_path}" ] || return 0
+
+  local _env_perm
   _env_perm="$(stat -c '%a' "${_env_path}" 2>/dev/null || stat -f '%Lp' "${_env_path}" 2>/dev/null || echo '?')"
   case "${_env_perm}" in
     600|400|200|'?') : ;;
@@ -103,8 +122,7 @@ if [ -f "${ENV_FILE}" ] || [ -f "${SCRIPT_DIR}/config.env" ]; then
       log_warn "Configuration file ${_env_path} is readable by group/others (perms ${_env_perm}). Consider 'chmod 600 ${_env_path}' - it contains credentials."
       ;;
   esac
-  unset _env_path _env_perm
-fi
+}
 
 # Helpers: Validation
 is_uint() {
@@ -215,28 +233,67 @@ log_info()    { log "INFO"  "${CYAN}"    "$1"; }
 log_success() { log "OK"    "${GREEN}"   "$1"; }
 log_warn()    { log "WARN"  "${YELLOW}"  "$1"; }
 log_error()   { log "ERROR" "${RED}"     "$1"; }
+log_debug() {
+  if [ "${DEBUG:-0}" = "1" ]; then
+    log "DEBUG" "${MAGENTA}" "$1"
+  fi
+}
 
-# Traps (must come after logging functions)
+# Config permission audit (needs logging functions above)
+check_env_permissions
+
+# =============================================================================
+# Traps & Error Handling (must come after logging functions)
+# =============================================================================
+
+# EXIT handler: remove sensitive temporary resources and report abnormal
+# termination. Runs on normal exit, errors, and signals alike.
 cleanup() {
+  local exit_code="$?"
+
   if [ -n "${NETRC_FILE}" ]; then
     rm -f -- "${NETRC_FILE}" 2>/dev/null || true
     NETRC_FILE=""
   fi
+
+  if [ "${exit_code}" -ne 0 ]; then
+    log_error "Backup run aborted (exit code ${exit_code})."
+  fi
 }
 trap cleanup EXIT
-trap 'log_error "Unexpected error near line ${BASH_LINENO[0]}: ${BASH_COMMAND}"' ERR
+
+# ERR handler: report the failing command with function/line context.
+# With `set -E` this trap is inherited by all functions. Commands guarded by
+# `|| ...` or `if !` never trigger it, so it only fires on *unhandled* errors.
+on_error() {
+  local exit_code="$?"
+  local frame="${FUNCNAME[1]:-main}"
+  local line_no="${BASH_LINENO[0]}"
+  log_error "Unhandled error (exit ${exit_code}) in ${frame} at ${SCRIPT_NAME}:${line_no}: ${BASH_COMMAND}"
+}
+trap on_error ERR
+
+# Signal handlers: log, then exit so the EXIT trap performs cleanup.
+on_signal() {
+  local signal="$1"
+  local exit_code="$2"
+  log_error "Received ${signal}, aborting and cleaning up..."
+  exit "${exit_code}"
+}
+trap 'on_signal SIGINT 130'  SIGINT
+trap 'on_signal SIGTERM 143' SIGTERM
+trap 'on_signal SIGHUP 129'  SIGHUP
 
 # Dependency Check
 check_dependencies() {
-  local missing=""
+  local -a required=(curl openssl stat find od date awk base64 sed tail tr)
+  local -a missing=()
   local cmd
-  for cmd in curl openssl stat find od date awk base64 sed tail tr; do
-    if ! command -v "${cmd}" >/dev/null 2>&1; then
-      missing="${missing} ${cmd}"
-    fi
+  for cmd in "${required[@]}"; do
+    command -v "${cmd}" >/dev/null 2>&1 || missing+=("${cmd}")
   done
-  if [ -n "${missing}" ]; then
-    log_error "Missing required commands:${missing}"
+  if [ "${#missing[@]}" -gt 0 ]; then
+    log_error "Missing required commands: ${missing[*]}"
     return 1
   fi
   return 0
@@ -265,6 +322,9 @@ Usage:
 Options:
   --dry-run      Check configuration and detect panel without running backup
   --help         Show this help message
+
+Debugging:
+  DEBUG=1 ./backup.sh    Enable DEBUG-level log output (verbose polling info)
 
 Supported Panels:
   • cPanel (UAPI Backup::fullbackup_to_homedir)
@@ -361,7 +421,9 @@ find_newest_backup() {
   local f newest="" newest_m=-1 m
   local tmp
   tmp="$(mktemp)" || return 1
-  trap 'rm -f -- "${tmp}"' RETURN
+  # Self-clearing trap: fire once for this function, then remove itself so it
+  # cannot leak into later function returns (where ${tmp} no longer exists).
+  trap 'rm -f -- "${tmp}"; trap - RETURN' RETURN
 
   # Use a temp file instead of process substitution so this works on systems
   # without /dev/fd (e.g. some containers/restricted shells).
@@ -477,6 +539,11 @@ hmac_sha256_hex() { # $1=key(hex) -> hex HMAC-SHA256 of stdin
   openssl dgst -sha256 -mac HMAC -macopt "hexkey:${key_hex}" | sed 's/^[^ ]* //'
 }
 
+hmac_sha1_base64() { # $1=key(hex) -> base64 HMAC-SHA1 of stdin (legacy SigV2)
+  local key_hex="$1"
+  openssl dgst -sha1 -mac HMAC -macopt "hexkey:${key_hex}" -binary | base64
+}
+
 str_to_hexkey() { # raw string -> hex (for use as -macopt hexkey)
   printf '%s' "$1" | _od_hex
 }
@@ -583,7 +650,7 @@ backup_to_s3() {
     local content_type="application/x-compressed-tar"
     local string_to_sign="PUT\n\n${content_type}\n${date_header}\n${canonical_uri}"
     local signature
-    signature="$(printf '%s' "${string_to_sign}" | openssl dgst -sha1 -binary -hmac "${S3_SECRET}" | base64)"
+    signature="$(printf '%s' "${string_to_sign}" | hmac_sha1_base64 "$(str_to_hexkey "${S3_SECRET}")")"
     auth_header="AWS ${S3_KEY}:${signature}"
     cfg="$(printf 'header = "Authorization: %s"\nheader = "Date: %s"\nheader = "Content-Type: %s"\n' \
       "${auth_header}" "${date_header}" "${content_type}")"
@@ -742,9 +809,10 @@ remote_parent() {
   return 1
 }
 
-# Extract a YYYY-MM-DD date from any string (or empty).
+# Extract a YYYY-MM-DD date from any string (or empty). Always returns 0 so
+# callers using plain assignment are safe under set -e / pipefail.
 extract_remote_date() {
-  printf '%s' "$1" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -n1
+  printf '%s' "$1" | { grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -n1 || true; }
 }
 
 # Generic signed S3 request (SigV4 only). Prints raw body + "\nHTTP_CODE".
@@ -808,7 +876,7 @@ s3_delete_key() {
     canonical_uri="/$(s3_uri_encode "${key}")"
   fi
   local resp code
-  resp="$(s3_signed_request DELETE "${canonical_uri}" "" "${host}")"
+  resp="$(s3_signed_request DELETE "${canonical_uri}" "" "${host}")" || true
   code="$(printf '%s\n' "${resp}" | tail -n1)"
   [[ "${code}" =~ ^2[0-9][0-9]$ ]]
 }
@@ -840,7 +908,7 @@ retention_s3() {
 
   local query resp code body
   query="list-type=2&prefix=$(s3_uri_encode "${parent}")"
-  resp="$(s3_signed_request GET "${canonical}" "${query}" "${host}")"
+  resp="$(s3_signed_request GET "${canonical}" "${query}" "${host}")" || true
   code="$(printf '%s\n' "${resp}" | tail -n1)"
   body="$(printf '%s\n' "${resp}" | sed '$d')"
 
@@ -869,11 +937,14 @@ retention_s3() {
 # FTP helpers (shared by ftp/ftps retention)
 
 # Recursively remove a remote FTP directory (delete files then RMD the dir).
+# Returns 0 only if the final RMD succeeded.
 ftp_rm_r() {
   local dir="$1"
   local proto="ftp"
   local -a ssl_args=()
-  [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ] && ssl_args+=(--ssl)
+  if [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ]; then
+    ssl_args+=(--ssl)
+  fi
 
   local files f
   files="$(curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --list-only \
@@ -884,7 +955,7 @@ ftp_rm_r() {
       -Q "DELE ${dir}/${f}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1 || true
   done <<< "${files}"
   curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" \
-    -Q "RMD ${dir}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1 || true
+    -Q "RMD ${dir}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1
 }
 
 # FTP/FTPS retention: list date dirs under the parent and remove older ones.
@@ -899,7 +970,9 @@ retention_ftp() {
 
   local proto="ftp"
   local -a ssl_args=()
-  [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ] && ssl_args+=(--ssl)
+  if [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ]; then
+    ssl_args+=(--ssl)
+  fi
 
   local listing
   listing="$(curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --list-only \
@@ -1017,11 +1090,14 @@ send_telegram() {
 # Wait Loop Shared Logic
 # Polls for a backup archive created during THIS run, waits until its size is
 # stable for STABLE_CHECKS consecutive polls, and sets BACKUP_FILE_* globals.
+# Usage: wait_for_backup_archive <dir> <label> <guard_fn> <pattern>...
+#   guard_fn: name of a function receiving the candidate path; returning 0
+#             means "keep waiting" (e.g. cPanel still packaging). Pass "" for none.
 wait_for_backup_archive() {
   local watch_dir="$1"
-  shift
-  local label="${@: -1}" # description for logs (last argument)
-  set -- "${@:1:$#-1}"
+  local label="$2"
+  local guard_fn="$3"
+  shift 3
   local -a patterns=("$@")
 
   log_info "Waiting for backup archive in ${watch_dir}..."
@@ -1035,9 +1111,17 @@ wait_for_backup_archive() {
 
   while [ "$(date +%s)" -lt "${deadline}" ]; do
     local candidate
-    candidate="$(find_newest_backup "${watch_dir}" "${patterns[@]}")"
+    # Never fatal: a failed poll (e.g. mktemp failure) just skips this cycle
+    candidate="$(find_newest_backup "${watch_dir}" "${patterns[@]}")" || true
+    log_debug "Poll candidate: ${candidate:-<none>}"
 
     if [ -n "${candidate}" ] && [ -f "${candidate}" ]; then
+      # Optional panel-specific "not ready yet" check (e.g. still packaging)
+      if [ -n "${guard_fn}" ] && "${guard_fn}" "${candidate}"; then
+        sleep "${POLL_INTERVAL}"
+        continue
+      fi
+
       local current_size
       current_size="$(get_file_size "${candidate}")"
 
@@ -1085,6 +1169,23 @@ wait_for_backup_archive() {
   return 0
 }
 
+# Guard callback for wait_for_backup_archive: cPanel keeps a directory next to
+# the archive while packaging; while it exists the archive is not complete.
+# Returns 0 (= keep waiting) while packaging, 1 when ready.
+cpanel_still_packaging() {
+  local candidate="$1"
+  local file_base
+  file_base="$(basename "${candidate}" .tar.gz)"
+
+  if [ -d "${USER_HOME}/${file_base}" ]; then
+    local current_size
+    current_size="$(get_file_size "${candidate}")"
+    log_info "  cPanel is still packaging backup directory (${file_base})... Size: $(format_bytes "${current_size}")"
+    return 0
+  fi
+  return 1
+}
+
 # cPanel Backup Routine
 run_cpanel_backup() {
   if ! command -v uapi >/dev/null 2>&1; then
@@ -1101,74 +1202,10 @@ run_cpanel_backup() {
   log_info "Waiting for cPanel backup archive to finish packaging in ${USER_HOME}..."
 
   # Poll using shared logic; cPanel creates a temp dir named like the archive
-  # while packaging, which the size-stability check handles naturally because
-  # the .tar.gz only appears once packaging completes.
-  local start_time
-  start_time="$(date +%s)"
-  local deadline=$((start_time + BACKUP_TIMEOUT))
-  local found_file=""
-  local previous_size=-1
-  local stable_count=0
-
-  while [ "$(date +%s)" -lt "${deadline}" ]; do
-    local candidate
-    candidate="$(find_newest_backup "${USER_HOME}" 'backup-*.tar.gz' "*${USERNAME}*.tar.gz")"
-
-    if [ -n "${candidate}" ] && [ -f "${candidate}" ]; then
-      local file_base current_size
-      file_base="$(basename "${candidate}" .tar.gz)"
-
-      # While packaging, cPanel keeps a directory next to the archive
-      if [ -d "${USER_HOME}/${file_base}" ]; then
-        current_size="$(get_file_size "${candidate}")"
-        log_info "  cPanel is still packaging backup directory (${file_base})... Size: $(format_bytes "${current_size}")"
-        stable_count=0
-        sleep "${POLL_INTERVAL}"
-        continue
-      fi
-
-      current_size="$(get_file_size "${candidate}")"
-      if ! is_uint "${current_size}"; then
-        current_size=0
-      fi
-
-      if [ "${current_size}" -gt 0 ]; then
-        if [ "${current_size}" -eq "${previous_size}" ]; then
-          stable_count=$((stable_count + 1))
-          log_info "  Archive size stable ($(format_bytes "${current_size}"), check ${stable_count}/${STABLE_CHECKS})..."
-          if [ "${stable_count}" -ge "${STABLE_CHECKS}" ]; then
-            found_file="${candidate}"
-            break
-          fi
-        else
-          stable_count=0
-          log_info "  Writing backup archive: $(basename "${candidate}") ($(format_bytes "${current_size}"))..."
-        fi
-        previous_size="${current_size}"
-      fi
-    else
-      log_info "  Waiting for backup process to initiate archive file..."
-    fi
-
-    sleep "${POLL_INTERVAL}"
-  done
-
-  if [ -z "${found_file}" ] || [ ! -f "${found_file}" ]; then
-    log_error "cPanel backup timed out after ${BACKUP_TIMEOUT} seconds!"
-    return 1
-  fi
-
-  BACKUP_FILE_PATH="${found_file}"
-  BACKUP_FILE_NAME="$(basename "${found_file}")"
-  BACKUP_FILE_SIZE="$(get_file_size "${found_file}")"
-
-  if ! is_uint "${BACKUP_FILE_SIZE}" || [ "${BACKUP_FILE_SIZE}" -le 0 ]; then
-    log_error "Backup archive exists but has invalid size: ${BACKUP_FILE_PATH}"
-    return 1
-  fi
-
-  log_success "Backup complete: ${BACKUP_FILE_NAME} ($(format_bytes "${BACKUP_FILE_SIZE}"))"
-  return 0
+  # while packaging, which the guard + size-stability check handle naturally
+  # because the .tar.gz only appears once packaging completes.
+  wait_for_backup_archive "${USER_HOME}" "cPanel backup archive" cpanel_still_packaging \
+    'backup-*.tar.gz' "*${USERNAME}*.tar.gz"
 }
 
 # DirectAdmin Backup Routine
@@ -1215,7 +1252,8 @@ run_directadmin_backup() {
     fi
   fi
 
-  wait_for_backup_archive "${backups_dir}" 'backup-*.tar.gz' 'backup-*.tar.zst' 'backup-*.tar.bz2' '*.tar.gz' "DirectAdmin backup archive"
+  wait_for_backup_archive "${backups_dir}" "DirectAdmin backup archive" "" \
+    'backup-*.tar.gz' 'backup-*.tar.zst' 'backup-*.tar.bz2' '*.tar.gz'
 }
 
 # Main Backup Process
