@@ -603,6 +603,12 @@ pct() { # pct <part> <total>
   awk -v a="$1" -v b="$2" 'BEGIN { if (b+0 > 0) printf "%d%%", a*100/b; else printf "?" }'
 }
 
+# Extract Content-Length from an HTTP-style header block (used by the FTP/SFTP
+# remote-size verifiers; curl maps FTP SIZE / SFTP stat to Content-Length).
+extract_content_length() {
+  printf '%s' "$1" | tr -d '\r' | awk 'tolower($1)=="content-length:" {print $2}' | tail -n1
+}
+
 # Storage Driver: S3 (SigV4 default, SigV2 legacy)
 backup_to_s3() {
   local local_path="$1"
@@ -691,6 +697,17 @@ backup_to_s3() {
   up_bytes="${PARSED_META[1]:-0}"
 
   if [ "${rc}" -ne 0 ]; then
+    # Transfer reached 100% but stalled before the HTTP response arrived
+    # (slow server post-processing, connection drop, etc.). The object may
+    # be complete - verify it via a signed HEAD request before failing.
+    if [ "${up_bytes}" = "${expected_size}" ]; then
+      log_warn "Transfer reached 100% but the connection stalled before the HTTP response - verifying remote object..."
+      if s3_verify_object "${object_key}" "${expected_size}"; then
+        log_success "Upload to S3 verified on remote server ($(format_bytes "${expected_size}")) despite stalled connection."
+        return 0
+      fi
+      log_warn "Remote size verification failed - treating upload as incomplete."
+    fi
     log_error "Upload to S3 failed at $(format_bytes "${up_bytes}") of $(format_bytes "${expected_size}") ($(pct "${up_bytes}" "${expected_size}")) - $(describe_curl_exit "${rc}")."
     return 1
   fi
@@ -707,6 +724,75 @@ backup_to_s3() {
     log_error "S3 Response: ${response_body}"
   fi
   return 1
+}
+
+# Verify a complete S3 object via signed HEAD request (SigV4).
+# Returns 0 only when the object exists and its Content-Length matches.
+s3_verify_object() {
+  local key="$1"
+  local expected="$2"
+  local host canonical_uri
+  if [ "${S3_USE_PATH_STYLE}" = "true" ]; then
+    host="${S3_ENDPOINT}"
+    canonical_uri="/$(s3_uri_encode "${S3_BUCKET}")/$(s3_uri_encode "${key}")"
+  else
+    host="${S3_BUCKET}.${S3_ENDPOINT}"
+    canonical_uri="/$(s3_uri_encode "${key}")"
+  fi
+
+  # --head makes curl send HEAD without waiting for a body
+  local resp code headers remote_size
+  resp="$(s3_signed_request HEAD "${canonical_uri}" "" "${host}" --head)" || true
+  code="$(printf '%s\n' "${resp}" | tail -n1)"
+  [[ "${code}" =~ ^2[0-9][0-9]$ ]] || return 1
+
+  headers="$(printf '%s\n' "${resp}" | sed '$d')"
+  remote_size="$(extract_content_length "${headers}")"
+  is_uint "${remote_size}" || return 1
+  [ "${remote_size}" = "${expected}" ]
+}
+
+# Verify remote file size on FTP/FTPS via HEAD (curl maps SIZE -> Content-Length).
+verify_remote_size_ftp() {
+  local remote_path="$1"
+  local expected="$2"
+  local proto="ftp"
+  local -a ssl_args=()
+  if [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ]; then
+    ssl_args+=(--ssl)
+  fi
+
+  local headers remote_size
+  headers="$(curl -sI \
+    "${ssl_args[@]}" \
+    --netrc-file "${NETRC_FILE}" \
+    --ftp-pasv \
+    --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
+    "${proto}://${FTP_HOST}:${FTP_PORT}${remote_path}" 2>/dev/null)" || true
+  remote_size="$(extract_content_length "${headers}")"
+  is_uint "${remote_size}" || return 1
+  [ "${remote_size}" = "${expected}" ]
+}
+
+# Verify remote file size on SFTP via HEAD (curl maps stat -> Content-Length).
+verify_remote_size_sftp() {
+  local remote_path="$1"
+  local expected="$2"
+
+  local -a insecure_args=()
+  if [ "${SFTP_INSECURE}" = "true" ]; then
+    insecure_args+=(--insecure)
+  fi
+
+  local headers remote_size
+  headers="$(curl -sI \
+    "${insecure_args[@]}" \
+    --netrc-file "${NETRC_FILE}" \
+    --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
+    "sftp://${SFTP_HOST}:${SFTP_PORT}${remote_path}" 2>/dev/null)" || true
+  remote_size="$(extract_content_length "${headers}")"
+  is_uint "${remote_size}" || return 1
+  [ "${remote_size}" = "${expected}" ]
 }
 
 # Storage Driver: FTP / FTPS Upload
@@ -750,6 +836,18 @@ backup_to_ftp() {
   up_bytes="${PARSED_META[0]:-0}"
 
   if [ "${rc}" -ne 0 ]; then
+    # Transfer reached 100% but stalled before the server's final "226"
+    # confirmation (common on FTPS: NAT/firewall drops the idle control
+    # connection, slow TLS shutdown, etc.). The data is likely on the server,
+    # so verify the remote size and only then accept the upload.
+    if [ "${up_bytes}" = "${expected_size}" ]; then
+      log_warn "Transfer reached 100% but the connection stalled before server confirmation - verifying remote file size..."
+      if verify_remote_size_ftp "${ftp_path}${file_name}" "${expected_size}"; then
+        log_success "Upload to FTP verified on remote server ($(format_bytes "${expected_size}")) despite stalled connection."
+        return 0
+      fi
+      log_warn "Remote size verification failed - treating upload as incomplete."
+    fi
     log_error "Upload to FTP failed at $(format_bytes "${up_bytes}") of $(format_bytes "${expected_size}") ($(pct "${up_bytes}" "${expected_size}")) - $(describe_curl_exit "${rc}")."
     return 1
   fi
@@ -805,6 +903,15 @@ backup_to_sftp() {
   up_bytes="${PARSED_META[0]:-0}"
 
   if [ "${rc}" -ne 0 ]; then
+    # Same 100%-but-stalled recovery as the FTP driver
+    if [ "${up_bytes}" = "${expected_size}" ]; then
+      log_warn "Transfer reached 100% but the connection stalled before server confirmation - verifying remote file size..."
+      if verify_remote_size_sftp "${sftp_path}${file_name}" "${expected_size}"; then
+        log_success "Upload to SFTP verified on remote server ($(format_bytes "${expected_size}")) despite stalled connection."
+        return 0
+      fi
+      log_warn "Remote size verification failed - treating upload as incomplete."
+    fi
     log_error "Upload to SFTP failed at $(format_bytes "${up_bytes}") of $(format_bytes "${expected_size}") ($(pct "${up_bytes}" "${expected_size}")) - $(describe_curl_exit "${rc}")."
     return 1
   fi
