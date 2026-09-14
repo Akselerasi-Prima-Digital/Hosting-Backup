@@ -759,7 +759,7 @@ verify_remote_size_ftp() {
   local proto="ftp"
   local -a ssl_args=()
   if [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ]; then
-    ssl_args+=(--ssl)
+    ssl_args+=(--ssl --tls-max 1.2)
   fi
 
   local headers remote_size
@@ -808,7 +808,7 @@ backup_to_ftp() {
   local proto="ftp"
   local -a ssl_args=()
   if [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ]; then
-    ssl_args+=(--ssl)
+    ssl_args+=(--ssl --tls-max 1.2)
   fi
 
   if ! make_netrc "${FTP_HOST}" "${FTP_USERNAME}" "${FTP_PASSWORD}"; then
@@ -1076,7 +1076,7 @@ ftp_rm_r() {
   local proto="ftp"
   local -a ssl_args=()
   if [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ]; then
-    ssl_args+=(--ssl)
+    ssl_args+=(--ssl --tls-max 1.2)
   fi
 
   local files f
@@ -1104,7 +1104,7 @@ retention_ftp() {
   local proto="ftp"
   local -a ssl_args=()
   if [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ]; then
-    ssl_args+=(--ssl)
+    ssl_args+=(--ssl --tls-max 1.2)
   fi
 
   local listing
