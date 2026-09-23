@@ -1030,6 +1030,8 @@ retention_s3() {
     return 0
   fi
 
+  parent="${parent#/}"
+
   local host canonical
   if [ "${S3_USE_PATH_STYLE}" = "true" ]; then
     host="${S3_ENDPOINT}"
@@ -1039,32 +1041,44 @@ retention_s3() {
     canonical="/"
   fi
 
-  local query resp code body
-  query="list-type=2&prefix=$(s3_uri_encode "${parent}")"
-  resp="$(s3_signed_request GET "${canonical}" "${query}" "${host}")" || true
-  code="$(printf '%s\n' "${resp}" | tail -n1)"
-  body="$(printf '%s\n' "${resp}" | sed '$d')"
-
-  if [[ ! "${code}" =~ ^2[0-9][0-9]$ ]]; then
-    log_warn "S3 retention: list failed (HTTP ${code}); skipping retention."
-    return 0
-  fi
-
   local key date_str m
-  while IFS= read -r key; do
-    [ -z "${key}" ] && continue
-    date_str="$(extract_remote_date "${key}")"
-    [ -n "${date_str}" ] || continue
-    m="$(date -d "${date_str}" +%s 2>/dev/null || true)"
-    [ -n "${m}" ] || continue
-    if [ "${m}" -lt "${cutoff_epoch}" ]; then
-      if s3_delete_key "${key}"; then
-        log_info "  Retention: deleted ${key} (${date_str})"
-      else
-        log_warn "  Retention: failed to delete ${key}"
-      fi
+  local query resp code body is_truncated continuation_token
+  continuation_token=""
+
+  while true; do
+    query="list-type=2&prefix=$(s3_uri_encode "${parent}")"
+    [ -n "${continuation_token}" ] && query="${query}&continuation-token=$(s3_uri_encode "${continuation_token}")"
+
+    resp="$(s3_signed_request GET "${canonical}" "${query}" "${host}")" || true
+    code="$(printf '%s\n' "${resp}" | tail -n1)"
+    body="$(printf '%s\n' "${resp}" | sed '$d')"
+
+    if [[ ! "${code}" =~ ^2[0-9][0-9]$ ]]; then
+      log_warn "S3 retention: list failed (HTTP ${code}); skipping retention."
+      return 0
     fi
-  done < <(printf '%s\n' "${body}" | grep -oE '<Key>[^<]*</Key>' | sed -E 's#</?Key>##g')
+
+    while IFS= read -r key; do
+      [ -z "${key}" ] && continue
+      date_str="$(extract_remote_date "${key}")"
+      [ -n "${date_str}" ] || continue
+      m="$(date -d "${date_str}" +%s 2>/dev/null || true)"
+      [ -n "${m}" ] || continue
+      if [ "${m}" -lt "${cutoff_epoch}" ]; then
+        if s3_delete_key "${key}"; then
+          log_info "  Retention: deleted ${key} (${date_str})"
+        else
+          log_warn "  Retention: failed to delete ${key}"
+        fi
+      fi
+    done < <(printf '%s\n' "${body}" | grep -oE '<Key>[^<]*</Key>' | sed -E 's#</?Key>##g')
+
+    # Pagination: continue only when the response signals there are more pages
+    is_truncated="$(printf '%s\n' "${body}" | grep -oE '<IsTruncated>[^<]*</IsTruncated>' | sed -E 's#</?IsTruncated>##g' | tr '[:upper:]' '[:lower:]')"
+    [ "${is_truncated}" = "true" ] || break
+    continuation_token="$(printf '%s\n' "${body}" | grep -oE '<NextContinuationToken>[^<]*</NextContinuationToken>' | sed -E 's#</?NextContinuationToken>##g')"
+    [ -n "${continuation_token}" ] || break
+  done
 }
 
 # FTP helpers (shared by ftp/ftps retention)
@@ -1081,16 +1095,16 @@ ftp_rm_r() {
   fi
 
   local files f
-  files="$(curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --list-only \
+  files="$(curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv --list-only \
     "${proto}://${FTP_HOST}:${FTP_PORT}/${dir}/" 2>/dev/null || true)"
   while IFS= read -r f; do
     [ -z "${f}" ] && continue
     f="$(basename -- "${f}")"
     [ -z "${f}" ] && continue
-    curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" \
+    curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv \
       -Q "DELE /${dir}/${f}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1 || true
   done <<< "${files}"
-  curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" \
+  curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv \
     -Q "RMD /${dir}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1
 }
 
@@ -1114,7 +1128,7 @@ retention_ftp() {
   fi
 
   local listing
-  listing="$(curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --list-only \
+  listing="$(curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv --list-only \
     "${proto}://${FTP_HOST}:${FTP_PORT}/${parent}/" 2>/dev/null || true)"
 
   local name basename_name date_str m
