@@ -1108,18 +1108,35 @@ ftp_rm_r() {
   fi
 
   local files f
-  files="$(curl -sS "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv --list-only \
+  files="$(curl -sS "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv \
     "${proto}://${FTP_HOST}:${FTP_PORT}/${dir}/" || true)"
   while IFS= read -r f; do
     f="${f%$'\r'}"
     [ -z "${f}" ] && continue
-    f="$(basename -- "${f}")"
+    f="${f##* }"
     [ -z "${f}" ] && continue
+    case "${f}" in
+      .|..) continue ;;
+    esac
     curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv \
       -Q "DELE /${dir}/${f}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1 || true
   done <<< "${files}"
   curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv \
     -Q "RMD /${dir}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1
+}
+
+# Delete a single remote FTP file via DELE. Returns 0 on success.
+ftp_delete_file() {
+  local file="$1"
+  file="${file#/}"
+  local proto="ftp"
+  local -a ssl_args=()
+  if [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ]; then
+    ssl_args+=(--ssl --tls-max 1.2)
+  fi
+
+  curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv \
+    -Q "DELE /${file}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1
 }
 
 # FTP/FTPS retention: list date dirs under the parent and remove older ones.
@@ -1142,7 +1159,7 @@ retention_ftp() {
   fi
 
   local listing
-  listing="$(curl -sS "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv --list-only \
+  listing="$(curl -sS "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv \
     "${proto}://${FTP_HOST}:${FTP_PORT}/${parent}/" || true)"
 
   # curl FTP listings carry CRLF line endings; log raw output when debugging
@@ -1163,8 +1180,11 @@ retention_ftp() {
   while IFS= read -r name; do
     name="${name%$'\r'}"
     [ -z "${name}" ] && continue
-    basename_name="$(basename -- "${name}")"
+    basename_name="${name##* }"
     [ -z "${basename_name}" ] && continue
+    case "${basename_name}" in
+      .|..) continue ;;
+    esac
     date_str="$(extract_remote_date "${basename_name}")"
     [ -n "${date_str}" ] || continue
     matched=$((matched + 1))
@@ -1174,7 +1194,22 @@ retention_ftp() {
       continue
     fi
     if [ "${m}" -lt "${cutoff_epoch}" ]; then
-      if ftp_rm_r "${parent}/${basename_name}"; then
+      local del_ok=0
+      case "${name}" in
+        d*)
+          # Directory: remove contents then RMD
+          if ftp_rm_r "${parent}/${basename_name}"; then
+            del_ok=1
+          fi
+          ;;
+        *)
+          # Regular file: single DELE
+          if ftp_delete_file "${parent}/${basename_name}"; then
+            del_ok=1
+          fi
+          ;;
+      esac
+      if [ "${del_ok}" -eq 1 ]; then
         log_info "  Retention: deleted /${parent}/${basename_name} (${date_str})"
       else
         failed=$((failed + 1))
