@@ -1073,6 +1073,7 @@ retention_s3() {
 # Returns 0 only if the final RMD succeeded.
 ftp_rm_r() {
   local dir="$1"
+  dir="${dir#/}"
   local proto="ftp"
   local -a ssl_args=()
   if [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ]; then
@@ -1084,11 +1085,13 @@ ftp_rm_r() {
     "${proto}://${FTP_HOST}:${FTP_PORT}/${dir}/" 2>/dev/null || true)"
   while IFS= read -r f; do
     [ -z "${f}" ] && continue
+    f="$(basename -- "${f}")"
+    [ -z "${f}" ] && continue
     curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" \
-      -Q "DELE ${dir}/${f}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1 || true
+      -Q "DELE /${dir}/${f}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1 || true
   done <<< "${files}"
   curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" \
-    -Q "RMD ${dir}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1
+    -Q "RMD /${dir}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1
 }
 
 # FTP/FTPS retention: list date dirs under the parent and remove older ones.
@@ -1101,6 +1104,9 @@ retention_ftp() {
     return 0
   fi
 
+  parent="${parent#/}"
+  parent="${parent%/}"
+
   local proto="ftp"
   local -a ssl_args=()
   if [ "${STORAGE_TYPE}" = "ftps" ] || [ "${FTP_SSL}" = "true" ]; then
@@ -1109,20 +1115,22 @@ retention_ftp() {
 
   local listing
   listing="$(curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --list-only \
-    "${proto}://${FTP_HOST}:${FTP_PORT}/${parent}" 2>/dev/null || true)"
+    "${proto}://${FTP_HOST}:${FTP_PORT}/${parent}/" 2>/dev/null || true)"
 
-  local name date_str m
+  local name basename_name date_str m
   while IFS= read -r name; do
     [ -z "${name}" ] && continue
-    date_str="$(extract_remote_date "${name}")"
+    basename_name="$(basename -- "${name}")"
+    [ -z "${basename_name}" ] && continue
+    date_str="$(extract_remote_date "${basename_name}")"
     [ -n "${date_str}" ] || continue
     m="$(date -d "${date_str}" +%s 2>/dev/null || true)"
     [ -n "${m}" ] || continue
     if [ "${m}" -lt "${cutoff_epoch}" ]; then
-      if ftp_rm_r "${parent%/}/${name}"; then
-        log_info "  Retention: deleted ${parent}/${name}"
+      if ftp_rm_r "${parent}/${basename_name}"; then
+        log_info "  Retention: deleted /${parent}/${basename_name} (${date_str})"
       else
-        log_warn "  Retention: failed to delete ${parent}/${name}"
+        log_warn "  Retention: failed to delete /${parent}/${basename_name}"
       fi
     fi
   done <<< "${listing}"
