@@ -1041,13 +1041,14 @@ retention_s3() {
     canonical="/"
   fi
 
-  local key date_str m
+  local key date_str m matched=0 deleted=0 failed=0
   local query resp code body is_truncated continuation_token
   continuation_token=""
 
   while true; do
+    # SigV4 requires query params in alphabetical order (continuation-token first)
     query="list-type=2&prefix=$(s3_uri_encode "${parent}")"
-    [ -n "${continuation_token}" ] && query="${query}&continuation-token=$(s3_uri_encode "${continuation_token}")"
+    [ -n "${continuation_token}" ] && query="continuation-token=$(s3_uri_encode "${continuation_token}")&${query}"
 
     resp="$(s3_signed_request GET "${canonical}" "${query}" "${host}")" || true
     code="$(printf '%s\n' "${resp}" | tail -n1)"
@@ -1062,12 +1063,18 @@ retention_s3() {
       [ -z "${key}" ] && continue
       date_str="$(extract_remote_date "${key}")"
       [ -n "${date_str}" ] || continue
+      matched=$((matched + 1))
       m="$(date -d "${date_str}" +%s 2>/dev/null || true)"
-      [ -n "${m}" ] || continue
+      if [ -z "${m}" ]; then
+        log_warn "  Retention: could not parse date '${date_str}' from key '${key}'; skipping."
+        continue
+      fi
       if [ "${m}" -lt "${cutoff_epoch}" ]; then
         if s3_delete_key "${key}"; then
+          deleted=$((deleted + 1))
           log_info "  Retention: deleted ${key} (${date_str})"
         else
+          failed=$((failed + 1))
           log_warn "  Retention: failed to delete ${key}"
         fi
       fi
@@ -1079,6 +1086,12 @@ retention_s3() {
     continuation_token="$(printf '%s\n' "${body}" | grep -oE '<NextContinuationToken>[^<]*</NextContinuationToken>' | sed -E 's#</?NextContinuationToken>##g')"
     [ -n "${continuation_token}" ] || break
   done
+
+  if [ "${matched}" -eq 0 ]; then
+    log_warn "S3 retention: no objects found under prefix '${parent}' - nothing to clean (check S3_PATH_PREFIX)."
+  else
+    log_info "S3 retention summary: ${deleted} deleted, ${failed} failed, ${matched} matched under '${parent}'."
+  fi
 }
 
 # FTP helpers (shared by ftp/ftps retention)
@@ -1095,9 +1108,10 @@ ftp_rm_r() {
   fi
 
   local files f
-  files="$(curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv --list-only \
-    "${proto}://${FTP_HOST}:${FTP_PORT}/${dir}/" 2>/dev/null || true)"
+  files="$(curl -sS "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv --list-only \
+    "${proto}://${FTP_HOST}:${FTP_PORT}/${dir}/" || true)"
   while IFS= read -r f; do
+    f="${f%$'\r'}"
     [ -z "${f}" ] && continue
     f="$(basename -- "${f}")"
     [ -z "${f}" ] && continue
@@ -1128,26 +1142,50 @@ retention_ftp() {
   fi
 
   local listing
-  listing="$(curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv --list-only \
-    "${proto}://${FTP_HOST}:${FTP_PORT}/${parent}/" 2>/dev/null || true)"
+  listing="$(curl -sS "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv --list-only \
+    "${proto}://${FTP_HOST}:${FTP_PORT}/${parent}/" || true)"
+
+  # curl FTP listings carry CRLF line endings; log raw output when debugging
+  if [ "${DEBUG:-0}" = "1" ]; then
+    log_debug "FTP retention raw listing of /${parent}/:"
+    while IFS= read -r dbg_line; do
+      log_debug "    | ${dbg_line}"
+    done <<< "${listing}"
+  fi
+
+  if [ -z "${listing}" ]; then
+    log_warn "FTP retention: directory listing of /${parent}/ is empty - nothing to clean (check FTP server permissions or SSL settings)."
+    return 0
+  fi
 
   local name basename_name date_str m
+  local matched=0 failed=0
   while IFS= read -r name; do
+    name="${name%$'\r'}"
     [ -z "${name}" ] && continue
     basename_name="$(basename -- "${name}")"
     [ -z "${basename_name}" ] && continue
     date_str="$(extract_remote_date "${basename_name}")"
     [ -n "${date_str}" ] || continue
+    matched=$((matched + 1))
     m="$(date -d "${date_str}" +%s 2>/dev/null || true)"
-    [ -n "${m}" ] || continue
+    if [ -z "${m}" ]; then
+      log_warn "  Retention: could not parse date '${date_str}' from '${basename_name}'; skipping."
+      continue
+    fi
     if [ "${m}" -lt "${cutoff_epoch}" ]; then
       if ftp_rm_r "${parent}/${basename_name}"; then
         log_info "  Retention: deleted /${parent}/${basename_name} (${date_str})"
       else
+        failed=$((failed + 1))
         log_warn "  Retention: failed to delete /${parent}/${basename_name}"
       fi
     fi
   done <<< "${listing}"
+
+  if [ "${matched}" -eq 0 ]; then
+    log_warn "FTP retention: no YYYY-MM-DD folders found in /${parent}/ listing - nothing to clean."
+  fi
 }
 
 # Retention dispatcher.
