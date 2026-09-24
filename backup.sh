@@ -1119,10 +1119,10 @@ ftp_rm_r() {
       .|..) continue ;;
     esac
     curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv \
-      -Q "DELE /${dir}/${f}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1 || true
+      -Q "DELE ${dir}/${f}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1 || true
   done <<< "${files}"
   curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv \
-    -Q "RMD /${dir}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1
+    -Q "RMD ${dir}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1
 }
 
 # Delete a single remote FTP file via DELE. Returns 0 on success.
@@ -1136,7 +1136,7 @@ ftp_delete_file() {
   fi
 
   curl -s "${ssl_args[@]}" --netrc-file "${NETRC_FILE}" --ftp-pasv \
-    -Q "DELE /${file}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1
+    -Q "DELE ${file}" "${proto}://${FTP_HOST}:${FTP_PORT}/" >/dev/null 2>&1
 }
 
 # FTP/FTPS retention: list date dirs under the parent and remove older ones.
